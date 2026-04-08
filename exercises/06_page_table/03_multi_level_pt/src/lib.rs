@@ -103,7 +103,7 @@ impl Sv39PageTable {
     /// 提示：右移 (12 + level * 9) 位，然后与 0x1FF 做掩码。
     pub fn extract_vpn(va: u64, level: usize) -> usize {
         // TODO: 从虚拟地址中提取指定级别的 VPN 索引
-        todo!()
+        ((va >> (12 + level * 9)) & 0x1FF) as usize
     }
 
     /// 建立从虚拟页到物理页的映射（4KB 页）。
@@ -119,7 +119,38 @@ impl Sv39PageTable {
         // 对于中间层级（level 2 和 level 1），如果对应 VPN 的页表项（PTE）无效（PTE_V == 0），
         // 则需要分配一个新的页表节点（使用 alloc_node），并将新节点的 PPN 写入当前 PTE（仅设置 PTE_V 标志）。
         // 最后在 level 0 的 PTE 中写入目标物理页号（pa >> 12）和 flags。
-        todo!()
+        let mut current_ppn = self.root_ppn;
+
+        for level in (0..=2).rev() {
+            let vpn_index = Self::extract_vpn(va, level);
+
+            if level == 0 {
+                // 最后一级：直接写入叶子 PTE
+                let node = self.nodes.get_mut(&current_ppn).unwrap();
+                node.entries[vpn_index] = (pa >> 12) << PPN_SHIFT | flags | PTE_V;
+                break;
+            }
+
+            // 中间级：先读取当前 PTE，并决定是否需要分配新页表
+            let (pte, need_alloc) = {
+                let node = self.nodes.get_mut(&current_ppn).unwrap();
+                let pte = node.entries[vpn_index];
+                (pte, pte & PTE_V == 0)
+            };
+
+            if need_alloc {
+                // 分配新页表页（此时没有持有 node 的可变借用）
+                let new_ppn = self.alloc_node();
+
+                // 重新获取当前节点并写入新 PTE
+                let node = self.nodes.get_mut(&current_ppn).unwrap();
+                node.entries[vpn_index] = (new_ppn << PPN_SHIFT) | PTE_V;
+                current_ppn = new_ppn;
+            } else {
+                // 继续向下遍历
+                current_ppn = (pte >> PPN_SHIFT) & 0xFFFFFFFFFFF;
+            }
+        }
     }
 
     /// 遍历三级页表，将虚拟地址翻译为物理地址。
@@ -141,7 +172,29 @@ impl Sv39PageTable {
         // 如果 PTE 是叶节点（即 R、W、X 标志位中有至少一个被置位），则可以直接使用该 PTE 中的物理页号（PPN）计算最终的物理地址。
         // 否则，该 PTE 指向下一级页表节点，继续遍历下一级。
         // 遍历到 level 0 时，PTE 必须是叶节点。
-        todo!()
+        let mut current_ppn = self.root_ppn;
+
+        for i in (0..=2).rev() {
+            let vpn_index = Self::extract_vpn(va, i);
+            let node = self.nodes.get(&current_ppn).unwrap();
+            let pte = node.entries[vpn_index];
+            
+            if pte & PTE_V == 0 {
+                return TranslateResult::PageFault;
+            }
+
+            if pte & (PTE_R | PTE_W | PTE_X) != 0 {
+                // 叶节点：计算物理地址
+                let ppn = (pte >> PPN_SHIFT) & 0xFFFFFFFFFFF;
+                let offset_bits=12 + i * 9; // 页内偏移位数 = 12 + level * 9
+                let offset = va & ((1 << offset_bits) - 1); // 页内偏移 = VA 的低 offset_bits 位
+                return TranslateResult::Ok((ppn << 12) | offset);
+            } else {
+                // 中间节点：继续向下遍历
+                current_ppn = (pte >> PPN_SHIFT) & 0xFFFFFFFFFFF;
+            }
+        }
+        return TranslateResult::PageFault;
     }
 
     /// 建立大页映射（2MB superpage，在 level 1 设叶子 PTE）。
@@ -155,12 +208,42 @@ impl Sv39PageTable {
         assert_eq!(pa % mega_size, 0, "pa must be 2MB-aligned");
 
         // TODO: 实现大页映射
-        //
+        // 
         // 提示：大页映射与普通页映射类似，但只需要遍历到 level 1。
         // 你需要在 level 2 找到或创建中间页表节点，然后在 level 1 写入叶子 PTE。
         // 注意大页的物理页号计算方式与普通页相同（pa >> 12），
         // 但翻译时 offset 包含虚拟地址的低 21 位（VPN[0] 部分 + 12 位页内偏移）。
-        todo!()
+        let mut current_ppn = self.root_ppn;
+
+        for i in (1..=2).rev() {
+            let vpn_index = Self::extract_vpn(va, i);
+            if i == 1 {
+                // level 1：写入叶子 PTE
+                let node = self.nodes.get_mut(&current_ppn).unwrap();
+                node.entries[vpn_index] = (pa >> 12) << PPN_SHIFT | flags | PTE_V;
+                break;
+            }
+
+            // level 2：先读取当前 PTE，并决定是否需要分配新页表
+            let (pte, need_alloc) = {
+                let node = self.nodes.get_mut(&current_ppn).unwrap();
+                let pte = node.entries[vpn_index];
+                (pte, pte & PTE_V == 0)
+            };
+
+            if need_alloc {
+                // 分配新页表页（此时没有持有 node 的可变借用）
+                let new_ppn = self.alloc_node();
+
+                // 重新获取当前节点并写入新 PTE
+                let node = self.nodes.get_mut(&current_ppn).unwrap();
+                node.entries[vpn_index] = (new_ppn << PPN_SHIFT) | PTE_V;
+                current_ppn = new_ppn;
+            } else {
+                // 继续向下遍历
+                current_ppn = (pte >> PPN_SHIFT) & 0xFFFFFFFFFFF;
+            }
+        }
     }
 }
 
